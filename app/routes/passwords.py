@@ -6,7 +6,9 @@ import motor.motor_asyncio
 from bson import ObjectId
 from dotenv import load_dotenv
 import os
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import base64
 
 from ..models.password import PasswordCreate, PasswordInDB
 from ..models.user import UserInDB
@@ -34,17 +36,50 @@ client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 db = client.get_database("password_manager")
 passwords_collection = db.get_collection("passwords")
 
-# Encryption setup
+# AES-256-GCM Encryption setup
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
     logger.error("ENCRYPTION_KEY not found in environment variables")
     raise ValueError("ENCRYPTION_KEY environment variable not set")
 
-try:
-    fernet = Fernet(ENCRYPTION_KEY.encode())
-except Exception as e:
-    logger.error(f"Failed to initialize Fernet: {str(e)}")
-    raise
+# Ensure key is 32 bytes for AES-256
+key = ENCRYPTION_KEY.encode().ljust(32)[:32]
+
+def encrypt_password(password: str) -> dict:
+    """Encrypt password using AES-256-GCM"""
+    try:
+        iv = os.urandom(12)  # 96-bit IV for GCM
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(password.encode()) + encryptor.finalize()
+        return {
+            "ciphertext": base64.b64encode(ciphertext).decode(),
+            "iv": base64.b64encode(iv).decode(),
+            "tag": base64.b64encode(encryptor.tag).decode(),
+            "version": "aes_gcm_v1"
+        }
+    except Exception as e:
+        logger.error(f"Encryption failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to encrypt password"
+        )
+
+def decrypt_password(encrypted_data: dict) -> str:
+    """Decrypt password using AES-256-GCM"""
+    try:
+        ciphertext = base64.b64decode(encrypted_data["ciphertext"])
+        iv = base64.b64decode(encrypted_data["iv"])
+        tag = base64.b64decode(encrypted_data["tag"])
+        cipher = Cipher(algorithms.AES(key), modes.GCM(iv, tag), backend=default_backend())
+        decryptor = cipher.decryptor()
+        return (decryptor.update(ciphertext) + decryptor.finalize()).decode()
+    except Exception as e:
+        logger.error(f"Decryption failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to decrypt password"
+        )
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """Get current user email from JWT token"""
@@ -63,30 +98,6 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             detail="Could not validate credentials"
         )
 
-def encrypt_password(password: str) -> str:
-    """Encrypt password using Fernet"""
-    try:
-        return fernet.encrypt(password.encode()).decode()
-    except Exception as e:
-        logger.error(f"Encryption failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to encrypt password"
-        )
-
-def decrypt_password(encrypted_password: str) -> str:
-    """Decrypt password using Fernet"""
-    try:
-        return fernet.decrypt(encrypted_password.encode()).decode()
-    except Exception as e:
-        logger.error(f"Decryption failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to decrypt password"
-        )
-    
-
-
 @router.post("/", response_model=PasswordInDB, status_code=status.HTTP_201_CREATED)
 async def create_password(
     password: PasswordCreate,
@@ -94,37 +105,20 @@ async def create_password(
 ):
     """Create a new password entry"""
     try:
-        # Prepare document for MongoDB
+        encrypted = encrypt_password(password.password)
         password_dict = password.dict()
         password_dict.update({
-            "password": encrypt_password(password.password),
+            "password": encrypted,
             "owner_email": email,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow()
         })
         
-        # Insert into MongoDB
         result = await passwords_collection.insert_one(password_dict)
-        if not result.inserted_id:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create password"
-            )
-            
-        # Return the created document
         new_password = await passwords_collection.find_one({"_id": result.inserted_id})
-        if not new_password:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve created password"
-            )
-        
-        # Convert ObjectId to string and return
         new_password["_id"] = str(new_password["_id"])
         return PasswordInDB(**new_password)
         
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"Error creating password: {str(e)}")
         raise HTTPException(
@@ -141,20 +135,18 @@ async def get_passwords(
     """Get all passwords for current user"""
     try:
         query = {"owner_email": email}
-        if category:
-            query["category"] = category
-        if search:
-            query["$or"] = [
-                {"title": {"$regex": search, "$options": "i"}},
-                {"username": {"$regex": search, "$options": "i"}},
-                {"url": {"$regex": search, "$options": "i"}}
-            ]
+        if category: query["category"] = category
+        if search: query["$or"] = [
+            {"title": {"$regex": search, "$options": "i"}},
+            {"username": {"$regex": search, "$options": "i"}},
+            {"url": {"$regex": search, "$options": "i"}}
+        ]
         
         passwords = []
         async for doc in passwords_collection.find(query).sort("title"):
             try:
-                doc["password"] = decrypt_password(doc["password"])
-                # Manually convert ObjectId to string
+                if isinstance(doc["password"], dict):  # New AES format
+                    doc["password"] = decrypt_password(doc["password"])
                 doc["_id"] = str(doc["_id"])
                 passwords.append(PasswordInDB(**doc))
             except Exception as e:
@@ -162,14 +154,12 @@ async def get_passwords(
                 continue
                 
         return passwords
-        
     except Exception as e:
         logger.error(f"Error fetching passwords: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error fetching passwords"
         )
-
 
 @router.put("/{password_id}", response_model=PasswordInDB)
 async def update_password(
@@ -179,16 +169,14 @@ async def update_password(
 ):
     """Update a password entry"""
     try:
-        # Verify ObjectId format
         try:
-            obj_id = ObjectId(password_id)  # Convert password_id to ObjectId
+            obj_id = ObjectId(password_id)
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid password ID format"
             )
             
-        # Verify ownership
         existing = await passwords_collection.find_one({
             "_id": obj_id,
             "owner_email": email
@@ -199,14 +187,12 @@ async def update_password(
                 detail="Password not found"
             )
         
-        # Prepare update
         update_data = password.dict()
         update_data.update({
             "password": encrypt_password(password.password),
             "updated_at": datetime.utcnow()
         })
         
-        # Perform update
         result = await passwords_collection.update_one(
             {"_id": obj_id},
             {"$set": update_data}
@@ -217,9 +203,8 @@ async def update_password(
                 detail="Failed to update password"
             )
             
-        # Return updated document and ensure _id is converted to string
         updated = await passwords_collection.find_one({"_id": obj_id})
-        updated["_id"] = str(updated["_id"])  # Convert ObjectId to string
+        updated["_id"] = str(updated["_id"])
         return PasswordInDB(**updated)
         
     except HTTPException:
@@ -231,7 +216,6 @@ async def update_password(
             detail="Error updating password"
         )
 
-
 @router.delete("/{password_id}")
 async def delete_password(
     password_id: str,
@@ -239,7 +223,6 @@ async def delete_password(
 ):
     """Delete a password entry"""
     try:
-        # Verify ObjectId format
         try:
             obj_id = ObjectId(password_id)
         except:
@@ -248,7 +231,6 @@ async def delete_password(
                 detail="Invalid password ID format"
             )
             
-        # Verify ownership
         existing = await passwords_collection.find_one({
             "_id": obj_id,
             "owner_email": email
@@ -259,7 +241,6 @@ async def delete_password(
                 detail="Password not found"
             )
         
-        # Perform deletion
         result = await passwords_collection.delete_one({"_id": obj_id})
         if result.deleted_count != 1:
             raise HTTPException(

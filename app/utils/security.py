@@ -18,7 +18,16 @@ if not SECRET_KEY:
     logger.error("SECRET_KEY not found in environment variables")
     raise ValueError("SECRET_KEY environment variable not set")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["argon2", "bcrypt"],  # Argon2 first, bcrypt fallback
+    deprecated="auto",
+    # Argon2 tuning parameters (adjust based on your server's capability)
+    argon2__time_cost=3,          # Number of iterations
+    argon2__memory_cost=65536,    # 64MB memory usage
+    argon2__parallelism=4,        # Number of parallel threads
+    argon2__hash_len=32,          # Hash output length (bytes)
+    argon2__salt_len=16           # Salt length (bytes)
+)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against a hash"""

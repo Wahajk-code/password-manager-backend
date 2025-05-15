@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union, Dict
 from bson import ObjectId
 from pydantic import BaseModel, Field, validator
 from ..utils.logger import get_logger
@@ -11,7 +11,7 @@ class PasswordBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
     url: Optional[str] = None
     username: str = Field(..., min_length=1, max_length=100)
-    password: str = Field(..., min_length=1)
+    password: Union[str, Dict[str, str]]  # Accept both string (legacy) and dict (AES)
     category: str = Field(default="Login")
     notes: Optional[str] = None
 
@@ -19,7 +19,6 @@ class PasswordBase(BaseModel):
     def validate_url(cls, v):
         if v is None or v == "":
             return None
-        # Enhanced URL validation
         url_pattern = re.compile(
             r'^(https?|ftp):\/\/'  # protocols
             r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+'  # domains
@@ -38,7 +37,7 @@ class PasswordCreate(PasswordBase):
     pass
 
 class PasswordInDB(PasswordBase):
-    id: str = Field(..., alias="_id")  # MongoDB _id is mapped to 'id'
+    id: str = Field(..., alias="_id")
     owner_email: str
     created_at: datetime
     updated_at: datetime
@@ -47,6 +46,6 @@ class PasswordInDB(PasswordBase):
         from_attributes = True
         json_encoders = {
             datetime: lambda v: v.isoformat(),
-            ObjectId: str  # Convert ObjectId to string here
+            ObjectId: str
         }
-        populate_by_name = True  # Allow both id and _id
+        populate_by_name = True
